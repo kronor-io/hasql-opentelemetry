@@ -1,0 +1,71 @@
+# hasql-opentelemetry
+
+OpenTelemetry tracing for [hasql](https://hackage.haskell.org/package/hasql) 2.
+
+hasql 2 talks to Postgres through a [pqi](https://hackage.haskell.org/package/pqi)
+adapter, which is a record of `IO` closures. This package wraps that adapter, so
+each command sent to Postgres becomes a client span. Your statements and
+sessions stay as they are.
+
+```haskell
+import Hasql.Connection qualified as Connection
+import Hasql.OpenTelemetry qualified as HasqlOtel
+import Pqi.Ffi qualified
+
+Connection.acquire (HasqlOtel.traced Pqi.Ffi.adapter) settings
+```
+
+Pass the same wrapped adapter to `hasql-pool`. It works with both `pqi-ffi` and `pqi-native`.
+
+## What a span carries
+
+| Attribute                         | Value                                                        |
+|-----------------------------------|--------------------------------------------------------------|
+| `db.system.name`                  | `postgresql`                                                 |
+| `db.namespace`                    | database name                                                |
+| `server.address`, `server.port`   | from the connection                                          |
+| `db.query.text`                   | the statement, whitespace collapsed, cut at 1024 characters  |
+| `db.operation.name`               | leading keyword (`SELECT`, `INSERT`, …)                      |
+| `db.postgresql.prepared_statement`| name it was prepared under, for executions of prepared statements |
+| `db.response.returned_rows`       | rows returned                                                |
+| `db.postgresql.affected_rows`     | rows affected by a command that returns none                 |
+| `db.response.status_code`, `error.type` | SQLSTATE, on failure                                   |
+
+Spans are timed from the send to the last result, and this holds in pipeline
+mode too, which is how hasql 2 runs every roundtrip. Prepares appear as separate
+`PREPARE …` spans.
+
+By default spans are only started when a span is already active on the calling
+thread, so pool warm-up and health checks don't start their own traces. Set
+`requireParentSpan = False` to trace everything.
+
+## What is never recorded
+
+**Parameter values** and the **text of server error reports** are never
+recorded. Postgres often puts the offending value in the error message (for
+example, `invalid input syntax for type uuid: "…"`), so a failure records only
+its SQLSTATE.
+
+SQL built at runtime with literal values spliced into it is recorded exactly as
+sent. Pass such values as parameters instead.
+
+## Datadog
+
+`tracedWith defaultConfig { datadogCompat = True }` changes three things so
+Datadog APM renders these spans as database queries:
+
+- span names become `postgresql.query`, `postgresql.prepare` and
+  `postgresql.describe`;
+- `span.type=sql` is added;
+- the statement is also set as `resource.name` and `db.statement`.
+
+## Testing
+
+The test suite runs real sessions against Postgres, configured through the
+usual `PGHOST` / `PGPORT` / `PGUSER` / `PGPASSWORD` / `PGDATABASE` variables.
+Without `PGHOST` it is skipped.
+
+```sh
+docker run --rm -d -p 5432:5432 -e POSTGRES_PASSWORD=postgres postgres:18
+PGHOST=localhost PGPASSWORD=postgres cabal test
+```
